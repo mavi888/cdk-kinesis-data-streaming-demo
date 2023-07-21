@@ -1,5 +1,7 @@
 *.js
 !jest.config.js
+!functions/*
+
 *.d.ts
 node_modules
 
@@ -7,3 +9,5 @@ node_modules
 .cdk.staging
 cdk.out
 package-lock.json
+response.json
+.vscode/settings.json
