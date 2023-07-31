@@ -1,48 +1,52 @@
 import * as cdk from 'aws-cdk-lib';
+import { Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
 import { Stream, StreamMode } from 'aws-cdk-lib/aws-kinesis';
-import {
-	Code,
-	EventSourceMapping,
-	Function,
-	Runtime,
-	StartingPosition,
-} from 'aws-cdk-lib/aws-lambda';
+import { CfnPipe } from 'aws-cdk-lib/aws-pipes';
 import { Construct } from 'constructs';
-import path = require('path');
 
 export class CdkKinesisDataStreamingDemoStack extends cdk.Stack {
 	constructor(scope: Construct, id: string, props?: cdk.StackProps) {
 		super(scope, id, props);
 
-		const stream = new Stream(this, 'KDS', {
-			streamName: 'my-kinesis-data-stream',
+		const sourceStream = new Stream(this, 'sourceStream', {
+			streamName: 'source-data-stream',
 			streamMode: StreamMode.ON_DEMAND,
 		});
 
-		const kdsProducerFunction = new Function(this, 'kdsProducerFunction', {
-			runtime: Runtime.NODEJS_18_X,
-			handler: 'producer.handler',
-			code: Code.fromAsset(path.join(__dirname, '../functions')),
-			environment: {
-				STREAM_NAME: stream.streamName,
+		const analyticsStream = new Stream(this, 'analyticsStream', {
+			streamName: 'analytics-data-stream',
+			streamMode: StreamMode.ON_DEMAND,
+		});
+
+		const analyticsPipeRole = new Role(this, 'AnalyticsPipeRole', {
+			assumedBy: new ServicePrincipal('pipes.amazonaws.com'),
+		});
+		sourceStream.grantRead(analyticsPipeRole);
+		analyticsStream.grantWrite(analyticsPipeRole);
+
+		const analyticsPipe = new CfnPipe(this, 'analyticsPipe', {
+			roleArn: analyticsPipeRole.roleArn,
+			source: sourceStream.streamArn,
+			target: analyticsStream.streamArn,
+			sourceParameters: {
+				filterCriteria: {
+					filters: [
+						{
+							pattern: '{"data": {"event_type": ["ANALYTICS"] }}',
+						},
+					],
+				},
+				kinesisStreamParameters: {
+					startingPosition: 'LATEST',
+				},
+			},
+			targetParameters: {
+				inputTemplate:
+					'{"event_type": <$.data.event_type>, "data": <$.data.some_data>, "partitionKey": <$.partitionKey>}',
+				kinesisStreamParameters: {
+					partitionKey: '$.partitionKey',
+				},
 			},
 		});
-
-		stream.grantWrite(kdsProducerFunction);
-
-		const kdsConsumerFunction = new Function(this, 'kdsConsumerFunction', {
-			runtime: Runtime.NODEJS_18_X,
-			handler: 'consumer.handler',
-			code: Code.fromAsset(path.join(__dirname, '../functions')),
-		});
-
-		new EventSourceMapping(this, 'KDSConsumerFunctionEvent', {
-			target: kdsConsumerFunction,
-			batchSize: 1,
-			startingPosition: StartingPosition.LATEST,
-			eventSourceArn: stream.streamArn,
-		});
-
-		stream.grantRead(kdsConsumerFunction);
 	}
 }
