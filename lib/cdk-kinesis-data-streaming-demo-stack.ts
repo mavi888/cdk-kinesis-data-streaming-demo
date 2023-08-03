@@ -2,10 +2,18 @@ import * as cdk from 'aws-cdk-lib';
 import { RemovalPolicy } from 'aws-cdk-lib';
 import { EventBus, Match, Rule } from 'aws-cdk-lib/aws-events';
 import { CloudWatchLogGroup } from 'aws-cdk-lib/aws-events-targets';
-import { Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
+import {
+	Effect,
+	PolicyDocument,
+	PolicyStatement,
+	Role,
+	ServicePrincipal,
+} from 'aws-cdk-lib/aws-iam';
 import { Stream, StreamMode } from 'aws-cdk-lib/aws-kinesis';
-import { LogGroup } from 'aws-cdk-lib/aws-logs';
+import { CfnDeliveryStream } from 'aws-cdk-lib/aws-kinesisfirehose';
+import { LogGroup, LogStream, RetentionDays } from 'aws-cdk-lib/aws-logs';
 import { CfnPipe } from 'aws-cdk-lib/aws-pipes';
+import { Bucket } from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 
 export class CdkKinesisDataStreamingDemoStack extends cdk.Stack {
@@ -104,5 +112,90 @@ export class CdkKinesisDataStreamingDemoStack extends cdk.Stack {
 					'{"event_type": <$.data.event_type>, "data": <$.data.some_data>, "partitionKey": <$.partitionKey>}',
 			},
 		});
+
+		// Kinesis Firehose destination bucket
+		const firehoseDestinationBucket = new Bucket(
+			this,
+			'analyticsDestinationBucket',
+			{
+				removalPolicy: RemovalPolicy.DESTROY,
+				autoDeleteObjects: true,
+			}
+		);
+
+		// log group for kinesis firehose errors
+		const logGroup = new LogGroup(this, 'analyticsKinesisFirehoseLogGroup', {
+			logGroupName: 'Analytics-KinesisFirehoseLogGroup',
+			removalPolicy: RemovalPolicy.DESTROY,
+			retention: RetentionDays.FIVE_DAYS,
+		});
+
+		// create a log stream for firehose
+		const logStream = new LogStream(this, 'analyticsKinesisFirehoseLogStream', {
+			logGroup: logGroup,
+			logStreamName: 'Analytics-KinesisFirehoseLogStream',
+			removalPolicy: RemovalPolicy.DESTROY,
+		});
+
+		// give permissions to firehose to put logs
+		const cloudWatchPolicy = new PolicyDocument({
+			statements: [
+				new PolicyStatement({
+					actions: ['logs:PutLogEvents'],
+					effect: Effect.ALLOW,
+					resources: [
+						`${logGroup.logGroupArn}:log-stream:${logStream.logStreamName}`,
+					],
+				}),
+			],
+		});
+
+		const streamPolicy = new PolicyDocument({
+			statements: [
+				new PolicyStatement({
+					actions: ['kinesis:DescribeStream'],
+					effect: Effect.ALLOW,
+					resources: [analyticsStream.streamArn],
+				}),
+			],
+		});
+
+		// IAM Role for Kinesis firehose
+		const kinesisfirehoseRole = new Role(this, 'analyticsKinesisFirehoseRole', {
+			roleName: 'analytics-kinesis-firehose-role',
+			assumedBy: new ServicePrincipal('firehose.amazonaws.com'),
+			inlinePolicies: {
+				cloudWatchPolicy,
+				streamPolicy,
+			},
+		});
+
+		// Grant permissions to the role to put objects in the bucket
+		firehoseDestinationBucket.grantPut(kinesisfirehoseRole);
+		firehoseDestinationBucket.grantWrite(kinesisfirehoseRole);
+
+		analyticsStream.grantReadWrite(kinesisfirehoseRole);
+
+		const kinesisFirehose = new CfnDeliveryStream(
+			this,
+			'analyticsKinesisFirehose',
+			{
+				deliveryStreamName: 'analytics-kinesis-firehose',
+				deliveryStreamType: 'KinesisStreamAsSource',
+				kinesisStreamSourceConfiguration: {
+					kinesisStreamArn: analyticsStream.streamArn,
+					roleArn: kinesisfirehoseRole.roleArn,
+				},
+				s3DestinationConfiguration: {
+					bucketArn: firehoseDestinationBucket.bucketArn,
+					roleArn: kinesisfirehoseRole.roleArn,
+					cloudWatchLoggingOptions: {
+						enabled: true,
+						logGroupName: logGroup.logGroupName,
+						logStreamName: logStream.logStreamName,
+					},
+				},
+			}
+		);
 	}
 }
