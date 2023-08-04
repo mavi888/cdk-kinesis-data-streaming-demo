@@ -4,6 +4,7 @@ import { EventBus, Match, Rule } from 'aws-cdk-lib/aws-events';
 import { CloudWatchLogGroup } from 'aws-cdk-lib/aws-events-targets';
 import {
 	Effect,
+	ManagedPolicy,
 	PolicyDocument,
 	PolicyStatement,
 	Role,
@@ -11,10 +12,12 @@ import {
 } from 'aws-cdk-lib/aws-iam';
 import { Stream, StreamMode } from 'aws-cdk-lib/aws-kinesis';
 import { CfnDeliveryStream } from 'aws-cdk-lib/aws-kinesisfirehose';
+import { Code, Function, Runtime } from 'aws-cdk-lib/aws-lambda';
 import { LogGroup, LogStream, RetentionDays } from 'aws-cdk-lib/aws-logs';
 import { CfnPipe } from 'aws-cdk-lib/aws-pipes';
 import { Bucket } from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
+import path = require('path');
 
 export class CdkKinesisDataStreamingDemoStack extends cdk.Stack {
 	constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -113,6 +116,64 @@ export class CdkKinesisDataStreamingDemoStack extends cdk.Stack {
 			},
 		});
 
+		// Policy that allows the function to put logs in CloudWatch Logs
+		const cwFunctionPolicy = new PolicyDocument({
+			statements: [
+				new PolicyStatement({
+					effect: Effect.ALLOW,
+					actions: [
+						'logs:CreateLogGroup',
+						'logs:CreateLogStream',
+						'logs:PutLogEvents',
+					],
+					resources: ['*'],
+				}),
+			],
+		});
+
+		// Role for lambda function to give comprehend permissions
+		const kinesisLambdaRole = new Role(this, 'kinesisLambdaRole', {
+			roleName: 'kinesisLambdaRole',
+			assumedBy: new ServicePrincipal('lambda.amazonaws.com'),
+			managedPolicies: [
+				ManagedPolicy.fromManagedPolicyArn(
+					this,
+					'ComprehendReadOnly',
+					'arn:aws:iam::aws:policy/ComprehendReadOnly'
+				),
+			],
+			inlinePolicies: {
+				cwFunctionPolicy,
+			},
+		});
+
+		//Lambda function for transforming kinesis records
+		const kinesisFunction = new Function(
+			this,
+			'analyzeKinesisFirehoseFunction',
+			{
+				runtime: Runtime.NODEJS_18_X,
+				code: Code.fromAsset(path.join(__dirname, '../functions')),
+				handler: 'kinesisFirehose.handler',
+				timeout: cdk.Duration.seconds(300),
+				role: kinesisLambdaRole,
+			}
+		);
+
+		// Policy that gives permissions to invoke the function
+		const kinesisLambdaPolicy = new PolicyDocument({
+			statements: [
+				new PolicyStatement({
+					effect: Effect.ALLOW,
+					actions: ['lambda:InvokeFunction'],
+					resources: [
+						kinesisFunction.functionArn,
+						`${kinesisFunction.functionArn}:*`,
+					],
+				}),
+			],
+		});
+
 		// Kinesis Firehose destination bucket
 		const firehoseDestinationBucket = new Bucket(
 			this,
@@ -167,6 +228,7 @@ export class CdkKinesisDataStreamingDemoStack extends cdk.Stack {
 			inlinePolicies: {
 				cloudWatchPolicy,
 				streamPolicy,
+				kinesisLambdaPolicy,
 			},
 		});
 
@@ -176,6 +238,7 @@ export class CdkKinesisDataStreamingDemoStack extends cdk.Stack {
 
 		analyticsStream.grantReadWrite(kinesisfirehoseRole);
 
+		//Kinesis Firehose configuration
 		const kinesisFirehose = new CfnDeliveryStream(
 			this,
 			'analyticsKinesisFirehose',
@@ -186,13 +249,39 @@ export class CdkKinesisDataStreamingDemoStack extends cdk.Stack {
 					kinesisStreamArn: analyticsStream.streamArn,
 					roleArn: kinesisfirehoseRole.roleArn,
 				},
-				s3DestinationConfiguration: {
+				extendedS3DestinationConfiguration: {
 					bucketArn: firehoseDestinationBucket.bucketArn,
 					roleArn: kinesisfirehoseRole.roleArn,
+					prefix: 'input/',
+					errorOutputPrefix: 'error/',
 					cloudWatchLoggingOptions: {
 						enabled: true,
 						logGroupName: logGroup.logGroupName,
 						logStreamName: logStream.logStreamName,
+					},
+					bufferingHints: {
+						sizeInMBs: 5,
+						intervalInSeconds: 60,
+					},
+					s3BackupConfiguration: {
+						bucketArn: firehoseDestinationBucket.bucketArn,
+						prefix: 'backup/',
+						roleArn: kinesisfirehoseRole.roleArn,
+						compressionFormat: 'UNCOMPRESSED',
+					},
+					processingConfiguration: {
+						enabled: true,
+						processors: [
+							{
+								type: 'Lambda',
+								parameters: [
+									{
+										parameterName: 'LambdaArn',
+										parameterValue: kinesisFunction.functionArn,
+									},
+								],
+							},
+						],
 					},
 				},
 			}
